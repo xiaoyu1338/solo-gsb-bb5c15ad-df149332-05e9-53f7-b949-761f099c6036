@@ -2,7 +2,7 @@
 
 const assert = require('node:assert');
 const { test } = require('node:test');
-const { layout } = require('../src/packer');
+const { layout, layoutBatch } = require('../src/packer');
 
 const EPS = 1e-6;
 
@@ -173,4 +173,108 @@ test('无成品时返回空版面', () => {
   assert.strictEqual(r.cuts.length, 0);
   assert.strictEqual(r.frees.length, 1);
   assert.strictEqual(r.stats.piecesTotal, 0);
+});
+
+/* ---------------- 批量排产 ---------------- */
+
+test('批量：需求在限额内全部完成，各张扣减一致', () => {
+  const r = layoutBatch({
+    paperW: 300, paperH: 200, kerf: 0, maxSheets: 10,
+    products: [{ width: 100, height: 100, quantity: 20 }],
+  });
+  assert.strictEqual(r.stopReason, 'completed');
+  assert.strictEqual(r.summary.piecesTotal, 20);
+  assert.strictEqual(r.summary.piecesPlaced, 20);
+  assert.strictEqual(r.summary.completionRate, 1);
+  assert.ok(r.summary.sheetsUsed >= 4 && r.summary.sheetsUsed <= 10); // 每张最多 6 件
+  assert.strictEqual(r.remaining.length, 0);
+  // 各张已排之和 = 总需求；总刀数 = 各张刀数之和
+  assert.strictEqual(r.sheets.reduce((s, sh) => s + sh.stats.piecesPlaced, 0), 20);
+  assert.strictEqual(r.summary.cutsTotal, r.sheets.reduce((s, sh) => s + sh.stats.cutsTotal, 0));
+  // 每张纸自身仍是合法的单张布局
+  for (const sh of r.sheets) {
+    assert.strictEqual(sh.paper.width, 300);
+    assert.ok(sh.stats.piecesPlaced > 0, '不应出现空白纸');
+  }
+});
+
+test('批量：达到用纸上限即停，剩余件数正确', () => {
+  const r = layoutBatch({
+    paperW: 300, paperH: 200, kerf: 0, maxSheets: 2,
+    products: [{ width: 100, height: 100, quantity: 20 }],
+  });
+  assert.strictEqual(r.stopReason, 'max-sheets');
+  assert.strictEqual(r.summary.sheetsUsed, 2);
+  assert.strictEqual(r.summary.piecesPlaced, 12); // 每张 3×2 = 6 件
+  assert.strictEqual(r.remaining.length, 1);
+  assert.strictEqual(r.remaining[0].quantity, 8);
+  assert.strictEqual(r.remaining[0].total, 20);
+  assert.strictEqual(r.remaining[0].placed, 12);
+  assert.ok(r.summary.completionRate > 0 && r.summary.completionRate < 1);
+});
+
+test('批量：某张纸排不进任何成品时立即停止，且不产生空白纸', () => {
+  const r = layoutBatch({
+    paperW: 200, paperH: 200, kerf: 2, maxSheets: 5,
+    products: [
+      { width: 100, height: 100, quantity: 1 }, // 第一张能排
+      { width: 500, height: 500, quantity: 2 }, // 永远排不进
+    ],
+  });
+  assert.strictEqual(r.stopReason, 'no-progress');
+  assert.strictEqual(r.summary.sheetsUsed, 1); // 空白的那张不计入
+  assert.strictEqual(r.summary.piecesPlaced, 1);
+  const big = r.remaining.find((u) => u.width === 500);
+  assert.strictEqual(big.quantity, 2);
+  assert.strictEqual(big.placed, 0);
+});
+
+test('批量：第一张就排不进时 sheets 为空、剩余为全部需求', () => {
+  const r = layoutBatch({
+    paperW: 200, paperH: 200, kerf: 2, maxSheets: 5,
+    products: [{ width: 500, height: 500, quantity: 3 }],
+  });
+  assert.strictEqual(r.stopReason, 'no-progress');
+  assert.strictEqual(r.sheets.length, 0);
+  assert.strictEqual(r.summary.sheetsUsed, 0);
+  assert.strictEqual(r.summary.piecesPlaced, 0);
+  assert.strictEqual(r.summary.completionRate, 0);
+  assert.strictEqual(r.remaining[0].quantity, 3);
+  assert.strictEqual(r.remaining[0].total, 3);
+});
+
+test('批量：空需求直接完成，不用纸', () => {
+  const r = layoutBatch({ paperW: 200, paperH: 200, kerf: 2, maxSheets: 5, products: [] });
+  assert.strictEqual(r.stopReason, 'completed');
+  assert.strictEqual(r.sheets.length, 0);
+  assert.strictEqual(r.summary.sheetsUsed, 0);
+  assert.strictEqual(r.summary.completionRate, 1);
+});
+
+test('批量：逐张扣减单调收敛（多种规格混合）', () => {
+  const r = layoutBatch({
+    paperW: 400, paperH: 300, kerf: 3, maxSheets: 20,
+    products: [
+      { name: 'A', width: 150, height: 120, quantity: 9 },
+      { name: 'B', width: 90, height: 60, quantity: 30 },
+    ],
+  });
+  // 每张已排数之和 + 剩余 = 总需求
+  const placedSum = r.sheets.reduce((s, sh) => s + sh.stats.piecesPlaced, 0);
+  const remainSum = r.remaining.reduce((s, u) => s + u.quantity, 0);
+  assert.strictEqual(placedSum, r.summary.piecesPlaced);
+  assert.strictEqual(placedSum + remainSum, 39);
+  // 逐张已排数单调无空白
+  for (const sh of r.sheets) assert.ok(sh.stats.piecesPlaced > 0);
+});
+
+test('批量：maxSheets 与成品输入校验', () => {
+  assert.throws(() => layoutBatch({ paperW: 100, paperH: 100, kerf: 1, maxSheets: 0, products: [] }));
+  assert.throws(() => layoutBatch({ paperW: 100, paperH: 100, kerf: 1, maxSheets: 2.5, products: [] }));
+  assert.throws(() => layoutBatch({ paperW: 100, paperH: 100, kerf: 1, maxSheets: 501, products: [] }));
+  assert.throws(() => layoutBatch({ paperW: 100, paperH: 100, kerf: 1, products: [] })); // 缺 maxSheets
+  // 成品校验沿用单张规则
+  assert.throws(() =>
+    layoutBatch({ paperW: 100, paperH: 100, kerf: 1, maxSheets: 3, products: [{ width: -1, height: 10, quantity: 1 }] })
+  );
 });

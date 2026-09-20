@@ -377,4 +377,117 @@ function layout(input) {
   };
 }
 
-module.exports = { layout };
+/**
+ * 批量排产：按与 layout() 完全相同的断头台规则逐张排样。
+ * 每张纸排完后，从剩余需求中扣除该张已排数量（直接以该张的
+ * unplaced 作为下一张的需求清单），直到满足任一终止条件：
+ *  - 全部成品排完           → stopReason: 'completed'
+ *  - 已用纸张达到 maxSheets → stopReason: 'max-sheets'
+ *  - 某张纸一件成品都排不进 → stopReason: 'no-progress'
+ *    （该空白纸不计入结果并立即停止，绝不输出空白纸；
+ *      循环上界为 maxSheets 且每张至少排入一件，必然终止）
+ *
+ * @param {object} input  同 layout()，另需 maxSheets：正整数（≤500）
+ * @returns {{
+ *   paper: object, stopReason: string,
+ *   summary: { maxSheets, sheetsUsed, piecesPlaced, piecesTotal, completionRate, cutsTotal },
+ *   sheets: Array,   // 每张纸各自完整的 layout() 结果
+ *   remaining: Array // 仍未排入的成品（结构同 layout() 的 unplaced）
+ * }}
+ */
+function layoutBatch(input) {
+  const maxSheets = Number(input.maxSheets);
+  if (!Number.isInteger(maxSheets) || maxSheets < 1) {
+    throw new Error('最多用纸张数必须是正整数');
+  }
+  if (maxSheets > 500) throw new Error('最多用纸张数不能超过 500');
+
+  // 首轮直接透传原始清单，纸张/成品校验由 layout 完成
+  let demand = input.products;
+  const originalTotal = new Map(); // id → 原始需求件数
+  const sheets = [];
+  let paper = null;
+  let lastUnplaced = [];
+  let totalPieces = 0;
+  let placedTotal = 0;
+  let cutsTotal = 0;
+  let stopReason = 'max-sheets';
+
+  for (let n = 0; n < maxSheets; n++) {
+    const result = layout({
+      paperW: input.paperW,
+      paperH: input.paperH,
+      kerf: input.kerf,
+      products: demand,
+    });
+    paper = result.paper;
+    lastUnplaced = result.unplaced;
+
+    if (n === 0) {
+      // 此时输入已通过 layout 校验，记录每种成品的原始需求
+      totalPieces = result.stats.piecesTotal;
+      demand.forEach((p, idx) => {
+        const q = Math.floor(Number(p.quantity));
+        if (!(q > 0)) return;
+        const id = p.id != null ? String(p.id) : `P${idx + 1}`;
+        originalTotal.set(id, (originalTotal.get(id) || 0) + q);
+      });
+    }
+
+    if (result.stats.piecesPlaced === 0) {
+      // 空白纸：不计入结果，立即止损
+      stopReason = placedTotal >= totalPieces ? 'completed' : 'no-progress';
+      break;
+    }
+
+    sheets.push(result);
+    placedTotal += result.stats.piecesPlaced;
+    cutsTotal += result.stats.cutsTotal;
+
+    if (placedTotal >= totalPieces) {
+      stopReason = 'completed';
+      break;
+    }
+
+    // 扣除本张已排数量，剩余需求进入下一张纸
+    demand = result.unplaced.map((u) => ({
+      id: u.id,
+      name: u.name,
+      width: u.width,
+      height: u.height,
+      quantity: u.quantity,
+    }));
+  }
+
+  const remaining = lastUnplaced.map((u) => {
+    const total = originalTotal.has(u.id) ? originalTotal.get(u.id) : u.total;
+    return {
+      id: u.id,
+      name: u.name,
+      width: u.width,
+      height: u.height,
+      total,
+      placed: total - u.quantity,
+      quantity: u.quantity,
+    };
+  });
+
+  const completionRate = totalPieces > 0 ? placedTotal / totalPieces : 1;
+
+  return {
+    paper,
+    stopReason,
+    summary: {
+      maxSheets,
+      sheetsUsed: sheets.length,
+      piecesPlaced: placedTotal,
+      piecesTotal: totalPieces,
+      completionRate: round3(completionRate * 1000) / 1000, // 0..1
+      cutsTotal,
+    },
+    sheets,
+    remaining,
+  };
+}
+
+module.exports = { layout, layoutBatch };

@@ -7,6 +7,11 @@ const PALETTE = [
 
 const $ = (id) => document.getElementById(id);
 
+function currentMode() {
+  const el = document.querySelector('input[name="mode"]:checked');
+  return el ? el.value : 'single';
+}
+
 function colorFor(id) {
   let h = 0;
   for (const ch of String(id)) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
@@ -56,7 +61,17 @@ function readForm() {
     }
   });
 
-  return { paperW, paperH, kerf, products };
+  const payload = { paperW, paperH, kerf, products };
+
+  if (currentMode() === 'batch') {
+    const maxSheets = Number($('maxSheets').value);
+    if (!Number.isInteger(maxSheets) || maxSheets < 1 || maxSheets > 500) {
+      throw new Error('最多用纸张数须为 1–500 的整数。');
+    }
+    payload.maxSheets = maxSheets;
+  }
+
+  return payload;
 }
 
 function fmt(n) {
@@ -239,7 +254,7 @@ function renderCutList(r) {
   `;
 }
 
-function renderUnplaced(r) {
+function renderUnplaced(r, heading = '排不下的成品') {
   if (!r.unplaced.length) {
     $('unplaced').innerHTML = r.stats.piecesTotal
       ? '<p class="badge-ok">✔ 全部成品均已排入。</p>'
@@ -255,12 +270,88 @@ function renderUnplaced(r) {
     </tr>
   `).join('');
   $('unplaced').innerHTML = `
-    <h3>排不下的成品</h3>
+    <h3>${heading}</h3>
     <table>
       <thead><tr><th>名称</th><th>规格 宽×高 (mm)</th><th>已排/需求</th><th>剩余</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>
   `;
+}
+
+/* ---------------- 批量排产 ---------------- */
+
+let batchState = null; // 最近一次批量排产结果
+
+const STOP_REASONS = {
+  completed: (s) => ['ok', `✔ 全部完成：${s.piecesTotal} 件成品共排入 ${s.sheetsUsed} 张纸。`],
+  'max-sheets': (s) => ['warn', `⚠ 已达最多用纸张数（${s.maxSheets} 张），仍有 ${s.piecesTotal - s.piecesPlaced} 件未排，已停止。`],
+  'no-progress': (s) => ['warn', `⚠ 第 ${s.sheetsUsed + 1} 张纸排不进任何剩余成品，已立即停止（未生成空白纸），剩余 ${s.piecesTotal - s.piecesPlaced} 件。`],
+};
+
+function renderBatch(data) {
+  batchState = data;
+  const s = data.summary;
+  const pct = (s.completionRate * 100).toFixed(1);
+  const [cls, text] = (STOP_REASONS[data.stopReason] || (() => ['warn', data.stopReason]))(s);
+
+  $('batchBar').innerHTML = `
+    <div class="stop-reason ${cls}">${text}</div>
+    <div class="stats">
+      <div class="stat">用纸数：<b>${s.sheetsUsed}</b> / 上限 ${s.maxSheets} 张</div>
+      <div class="stat">已排/总数：<b>${s.piecesPlaced}/${s.piecesTotal}</b> 件</div>
+      <div class="stat">总刀数：<b>${s.cutsTotal}</b></div>
+      <div class="stat" style="flex-basis:100%">完成率：<b>${pct}%</b>
+        <div class="ratio-bar${s.completionRate < 1 ? ' low' : ''}"><span style="width:${(s.completionRate * 100).toFixed(2)}%"></span></div>
+      </div>
+    </div>
+  `;
+  $('batchBar').hidden = false;
+
+  const tabs = $('sheetTabs');
+  if (data.sheets.length > 1) {
+    tabs.innerHTML = data.sheets.map((sh, i) =>
+      `<button type="button" data-i="${i}">第 ${i + 1} 张（${sh.stats.piecesPlaced} 件）</button>`
+    ).join('');
+    [...tabs.querySelectorAll('button')].forEach((b) =>
+      b.addEventListener('click', () => showSheet(Number(b.dataset.i)))
+    );
+    tabs.hidden = false;
+  } else {
+    tabs.innerHTML = '';
+    tabs.hidden = true;
+  }
+
+  if (data.sheets.length) {
+    showSheet(0);
+  } else {
+    $('stats').innerHTML = '';
+    $('svgWrap').innerHTML = '<div class="placeholder">没有可用纸张布局（第一张纸就排不进任何成品）</div>';
+    $('cutList').innerHTML = '';
+  }
+
+  // 批量剩余需求（结构同单张的 unplaced）
+  renderUnplaced(
+    { unplaced: data.remaining, stats: { piecesTotal: s.piecesTotal } },
+    '未排完的成品（剩余需求）'
+  );
+}
+
+function showSheet(i) {
+  if (!batchState || !batchState.sheets[i]) return;
+  const sheet = batchState.sheets[i];
+  [...$('sheetTabs').querySelectorAll('button')].forEach((b, j) =>
+    b.classList.toggle('active', j === i));
+  renderStats(sheet);
+  renderSvg(sheet);
+  renderCutList(sheet);
+}
+
+function clearBatchUi() {
+  batchState = null;
+  $('batchBar').hidden = true;
+  $('batchBar').innerHTML = '';
+  $('sheetTabs').hidden = true;
+  $('sheetTabs').innerHTML = '';
 }
 
 async function generate() {
@@ -275,19 +366,25 @@ async function generate() {
     return;
   }
 
+  const batch = currentMode() === 'batch';
   $('generate').disabled = true;
   try {
-    const resp = await fetch('/api/layout', {
+    const resp = await fetch(batch ? '/api/layout/batch' : '/api/layout', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || '排样失败');
-    renderStats(data);
-    renderSvg(data);
-    renderCutList(data);
-    renderUnplaced(data);
+    if (batch) {
+      renderBatch(data);
+    } else {
+      clearBatchUi();
+      renderStats(data);
+      renderSvg(data);
+      renderCutList(data);
+      renderUnplaced(data);
+    }
   } catch (e) {
     errBox.textContent = e.message;
     errBox.hidden = false;
@@ -303,6 +400,13 @@ $('preset').addEventListener('change', (e) => {
   $('paperW').value = w;
   $('paperH').value = h;
 });
+document.querySelectorAll('input[name="mode"]').forEach((r) =>
+  r.addEventListener('change', () => {
+    const batch = currentMode() === 'batch';
+    $('batchOpts').hidden = !batch;
+    $('generate').textContent = batch ? '生成排产方案' : '生成裁切方案';
+  })
+);
 $('addRow').addEventListener('click', () => addProductRow());
 $('clearBtn').addEventListener('click', () => {
   $('productRows').innerHTML = '';

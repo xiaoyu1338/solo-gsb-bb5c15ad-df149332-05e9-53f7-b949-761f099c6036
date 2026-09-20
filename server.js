@@ -2,7 +2,7 @@
 
 const path = require('node:path');
 const express = require('express');
-const { layout } = require('./src/packer');
+const { layout, layoutBatch } = require('./src/packer');
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
@@ -18,6 +18,17 @@ app.post('/api/layout', (req, res) => {
   try {
     const body = req.body || {};
     const result = layout(body);
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message || '输入无效' });
+  }
+});
+
+// 批量排产：逐张排样直到完成 / 达到上限 / 某张纸无进展
+app.post('/api/layout/batch', (req, res) => {
+  try {
+    const body = req.body || {};
+    const result = layoutBatch(body);
     res.json(result);
   } catch (err) {
     res.status(400).json({ error: err.message || '输入无效' });
