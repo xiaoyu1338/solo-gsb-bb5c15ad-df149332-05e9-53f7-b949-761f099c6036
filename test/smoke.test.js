@@ -2,7 +2,7 @@
 
 const assert = require('node:assert');
 const { test } = require('node:test');
-const { layout } = require('../src/packer');
+const { layout, batchLayout, BATCH_MAX_SHEETS_LIMIT } = require('../src/packer');
 
 const EPS = 1e-6;
 
@@ -173,4 +173,141 @@ test('无成品时返回空版面', () => {
   assert.strictEqual(r.cuts.length, 0);
   assert.strictEqual(r.frees.length, 1);
   assert.strictEqual(r.stats.piecesTotal, 0);
+});
+
+// ---------- 批量排产 ----------
+
+test('批量：多张纸完成全部需求，逐张扣减且完成率 100%', () => {
+  // 100×100 纸、刀缝 0，每纸恰好 4 件；共 10 件 → 至少 3 张
+  const r = batchLayout({
+    paperW: 200, paperH: 200, kerf: 0,
+    products: [{ width: 100, height: 100, quantity: 10 }],
+    maxSheets: 10,
+  });
+  assert.strictEqual(r.stopReason, 'completed');
+  assert.strictEqual(r.sheets.length, 3);
+  assert.deepStrictEqual(r.sheets.map((s) => s.sheet), [1, 2, 3]);
+  assert.deepStrictEqual(r.sheets.map((s) => s.stats.piecesPlaced), [4, 4, 2]);
+  assert.strictEqual(r.stats.totalPlaced, 10);
+  assert.strictEqual(r.stats.totalDemand, 10);
+  assert.strictEqual(r.stats.sheetsUsed, 3);
+  assert.ok(Math.abs(r.stats.completionRate - 1) < 1e-6);
+  assert.strictEqual(r.stats.totalCuts, r.sheets.reduce((s, x) => s + x.stats.cutsTotal, 0));
+  assert.strictEqual(r.remaining.length, 0);
+});
+
+test('批量：达到用纸上限时按 max_sheets 终止并保留剩余件', () => {
+  const r = batchLayout({
+    paperW: 200, paperH: 200, kerf: 0,
+    products: [{ width: 100, height: 100, quantity: 10 }],
+    maxSheets: 2,
+  });
+  assert.strictEqual(r.stopReason, 'max_sheets');
+  assert.strictEqual(r.sheets.length, 2);
+  assert.strictEqual(r.stats.totalPlaced, 8);
+  assert.strictEqual(r.remaining.length, 1);
+  assert.strictEqual(r.remaining[0].quantity, 2);
+  assert.strictEqual(r.remaining[0].placed, 8);
+  assert.strictEqual(r.remaining[0].total, 10);
+  assert.ok(Math.abs(r.stats.completionRate - 0.8) < 1e-6);
+});
+
+test('批量：无进展立即停止，不生成空白纸', () => {
+  // 300 宽的件永远进不了 200 宽的纸：首张即 0 件
+  const r = batchLayout({
+    paperW: 200, paperH: 200, kerf: 2,
+    products: [{ width: 300, height: 50, quantity: 3 }],
+    maxSheets: 5,
+  });
+  assert.strictEqual(r.stopReason, 'no_progress');
+  assert.strictEqual(r.sheets.length, 0);
+  assert.strictEqual(r.stats.totalPlaced, 0);
+  assert.strictEqual(r.stats.sheetsUsed, 0);
+  assert.strictEqual(r.remaining[0].quantity, 3);
+  assert.strictEqual(r.stats.totalCuts, 0);
+});
+
+test('批量：可排小件排完后遇到排不下的大件，在无进展纸上停止', () => {
+  const r = batchLayout({
+    paperW: 200, paperH: 200, kerf: 2,
+    products: [
+      { id: 'A', width: 50, height: 50, quantity: 4 }, // 第一张即可全部排完
+      { id: 'B', width: 300, height: 50, quantity: 2 }, // 永远排不进
+    ],
+    maxSheets: 5,
+  });
+  // 第一张排入 4 个 A（B 不进）；第二张只剩 B → 0 件 → 停止
+  assert.strictEqual(r.stopReason, 'no_progress');
+  assert.strictEqual(r.sheets.length, 1);
+  assert.strictEqual(r.sheets[0].stats.piecesPlaced, 4);
+  assert.strictEqual(r.stats.totalPlaced, 4);
+  assert.strictEqual(r.remaining.length, 1);
+  assert.strictEqual(r.remaining[0].id, 'B');
+  assert.strictEqual(r.remaining[0].quantity, 2);
+});
+
+test('批量：每张布局独立、坐标合法且成品互不重叠', () => {
+  const r = batchLayout({
+    paperW: 300, paperH: 200, kerf: 3,
+    products: [{ width: 90, height: 60, quantity: 20 }],
+    maxSheets: 4,
+  });
+  assert.ok(r.sheets.length >= 2);
+  for (const sheet of r.sheets) {
+    for (const it of sheet.items) {
+      assert.ok(it.x >= -EPS && it.y >= -EPS);
+      assert.ok(it.x + it.w <= 300 + EPS && it.y + it.h <= 200 + EPS);
+    }
+    for (let i = 0; i < sheet.items.length; i++) {
+      for (let j = i + 1; j < sheet.items.length; j++) {
+        assert.ok(!rectsOverlap(sheet.items[i], sheet.items[j]));
+      }
+    }
+    allCuts(sheet, 3);
+  }
+});
+
+test('批量：累计扣减与各张件数之和等于总已排数', () => {
+  const r = batchLayout({
+    paperW: 420, paperH: 297, kerf: 3,
+    products: [
+      { id: 'A', width: 100, height: 100, quantity: 7 },
+      { id: 'B', width: 60, height: 200, quantity: 5 },
+    ],
+    maxSheets: 6,
+  });
+  const sumA = r.sheets.reduce(
+    (s, sh) => s + sh.items.filter((it) => it.id === 'A').length, 0
+  );
+  const sumB = r.sheets.reduce(
+    (s, sh) => s + sh.items.filter((it) => it.id === 'B').length, 0
+  );
+  const remA = r.remaining.find((x) => x.id === 'A');
+  const remB = r.remaining.find((x) => x.id === 'B');
+  assert.strictEqual(sumA + (remA ? remA.quantity : 0), 7);
+  assert.strictEqual(sumB + (remB ? remB.quantity : 0), 5);
+  assert.strictEqual(sumA + sumB, r.stats.totalPlaced);
+});
+
+test('批量：非法 maxSheets 抛出错误', () => {
+  const base = { paperW: 100, paperH: 100, kerf: 1, products: [] };
+  assert.throws(() => batchLayout({ ...base, maxSheets: 0 }));
+  assert.throws(() => batchLayout({ ...base, maxSheets: -3 }));
+  assert.throws(() => batchLayout({ ...base, maxSheets: 1.5 }));
+  assert.throws(() => batchLayout({ ...base, maxSheets: BATCH_MAX_SHEETS_LIMIT + 1 }));
+  assert.throws(() => batchLayout({ ...base, maxSheets: 'abc' }));
+});
+
+test('批量：需求为空时用纸 0 张且视为完成', () => {
+  const r = batchLayout({
+    paperW: 100, paperH: 100, kerf: 1,
+    products: [],
+    maxSheets: 3,
+  });
+  assert.strictEqual(r.sheets.length, 0);
+  assert.strictEqual(r.stopReason, 'completed');
+  assert.strictEqual(r.stats.totalPlaced, 0);
+  assert.strictEqual(r.stats.totalDemand, 0);
+  assert.strictEqual(r.stats.sheetsUsed, 0);
+  assert.strictEqual(r.stats.completionRate, 1);
 });

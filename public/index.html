@@ -3,17 +3,23 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>单张纸直线裁切试排</title>
+  <title>纸张直线裁切试排 · 单张 / 批量排产</title>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
   <header class="topbar">
-    <h1>单张纸直线裁切试排</h1>
+    <h1>纸张直线裁切试排</h1>
     <p class="subtitle">断头台式裁切 · 每次一刀切到底、一分为二 · 成品允许旋转 90° · 刀缝不侵占成品</p>
   </header>
 
   <main class="layout">
     <section class="panel form-panel">
+      <h2>排样模式</h2>
+      <div class="mode-switch" role="tablist">
+        <button type="button" class="mode-btn active" data-mode="single" role="tab">单张排样</button>
+        <button type="button" class="mode-btn" data-mode="batch" role="tab">批量排产</button>
+      </div>
+
       <h2>纸张与刀缝</h2>
       <div class="field-grid">
         <label>纸张宽度 (mm)
@@ -35,6 +41,9 @@
             <option value="889x1194" selected>大度全张 889×1194</option>
           </select>
         </label>
+        <label class="preset batch-only" hidden>最多用纸张数
+          <input type="number" id="maxSheets" value="10" min="1" max="1000" step="1" />
+        </label>
       </div>
 
       <h2>成品清单</h2>
@@ -52,13 +61,15 @@
     </section>
 
     <section class="panel result-panel">
-      <h2>排料结果</h2>
+      <h2 id="resultTitle">排料结果</h2>
+      <div id="batchBar" class="batch-bar" hidden></div>
       <div id="stats" class="stats"></div>
       <div id="svgWrap" class="svg-wrap">
         <div class="placeholder">填写左侧参数后点击「生成裁切方案」</div>
       </div>
       <div id="cutList" class="cut-list"></div>
       <div id="unplaced" class="unplaced"></div>
+      <div id="batchRemaining" class="unplaced" hidden></div>
     </section>
   </main>
 

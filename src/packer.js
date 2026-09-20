@@ -377,4 +377,144 @@ function layout(input) {
   };
 }
 
-module.exports = { layout };
+/**
+ * 批量排产：按同一断头台规则逐张排样，每张排完后从剩余需求中扣减已排数量，
+ * 直到：全部完成 / 用纸张数达到 maxSheets / 某张纸排不进任何成品（无进展立即停止，
+ * 不生成空白纸，也不会死循环）。
+ *
+ * @param {object} input
+ *   paperW, paperH, kerf, products：同 layout
+ *   maxSheets: number 最多用纸张数（1 ~ BATCH_MAX_SHEETS_LIMIT 的整数）
+ * @returns {{
+ *   paper, maxSheets,
+ *   sheets: Array,       // 每张纸一个与 layout 完全同构的独立布局（额外带 sheet 序号）
+ *   remaining: Array,    // 结束后仍未完成的需求（id/规格/总量/已排/剩余）
+ *   stats: { totalDemand, totalPlaced, sheetsUsed, maxSheets,
+ *            completionRate, totalCuts, stopReason },
+ *   stopReason: 'completed' | 'max_sheets' | 'no_progress',
+ * }}
+ */
+const BATCH_MAX_SHEETS_LIMIT = 1000;
+
+function batchLayout(input) {
+  const paperW = Number(input.paperW);
+  const paperH = Number(input.paperH);
+  const kerf = Number(input.kerf);
+  if (![paperW, paperH, kerf].every((n) => Number.isFinite(n))) {
+    throw new Error('纸张尺寸或刀缝宽度不是有效数字');
+  }
+  if (paperW <= 0 || paperH <= 0) throw new Error('纸张宽高必须大于 0');
+  if (kerf < 0) throw new Error('刀缝宽度不能为负');
+  if (!Array.isArray(input.products)) throw new Error('缺少成品列表');
+
+  const maxSheets = Number(input.maxSheets);
+  if (!Number.isInteger(maxSheets) || maxSheets < 1) {
+    throw new Error('最多用纸张数必须是不小于 1 的整数');
+  }
+  if (maxSheets > BATCH_MAX_SHEETS_LIMIT) {
+    throw new Error(`最多用纸张数不能超过 ${BATCH_MAX_SHEETS_LIMIT}`);
+  }
+
+  // 剩余需求：按 id+规格 聚合（同一规格的多行合并计数）
+  const remaining = new Map();
+  let totalDemand = 0;
+  input.products.forEach((p, idx) => {
+    const w = Number(p.width);
+    const h = Number(p.height);
+    const q = Math.floor(Number(p.quantity));
+    if (![w, h].every((n) => Number.isFinite(n)) || w <= 0 || h <= 0) {
+      throw new Error(`第 ${idx + 1} 种成品的宽高必须为正数`);
+    }
+    if (!Number.isFinite(q) || q < 0) {
+      throw new Error(`第 ${idx + 1} 种成品的数量无效`);
+    }
+    if (q === 0) return;
+    const id = p.id != null ? String(p.id) : `P${idx + 1}`;
+    const name = p.name && String(p.name).trim() ? String(p.name).trim() : '';
+    const key = `${id}|${round3(w)}|${round3(h)}`;
+    const entry = remaining.get(key);
+    if (entry) {
+      entry.q += q;
+      entry.total += q;
+    } else {
+      remaining.set(key, { id, name, w, h, q, total: q });
+    }
+    totalDemand += q;
+  });
+
+  const sheets = [];
+  let totalPlaced = 0;
+  let totalCuts = 0;
+  let stopReason = 'completed';
+
+  while (sheets.length < maxSheets && remaining.size > 0) {
+    // 用当前剩余需求排一张新纸（layout 为纯函数，每次独立）
+    const products = [...remaining.values()].map((e) => ({
+      id: e.id, name: e.name, width: e.w, height: e.h, quantity: e.q,
+    }));
+    const r = layout({ paperW, paperH, kerf, products });
+
+    // 无进展：这张纸一件都没排进 —— 立即停止，不保留空白纸
+    if (r.stats.piecesPlaced === 0) {
+      stopReason = 'no_progress';
+      break;
+    }
+
+    // 从剩余需求中扣减本张已排数量（按 id+规格 容差对账，规避输出坐标的 round3 舍入）
+    const entries = [...remaining.values()];
+    for (const it of r.items) {
+      const entry = entries.find(
+        (e) => e.id === it.id &&
+          Math.abs(e.w - it.specW) < 1e-3 &&
+          Math.abs(e.h - it.specH) < 1e-3
+      );
+      if (entry) {
+        entry.q -= 1;
+        totalPlaced += 1;
+      }
+    }
+    for (const [key, entry] of remaining) {
+      if (entry.q <= 0) remaining.delete(key);
+    }
+
+    totalCuts += r.stats.cutsTotal;
+    sheets.push(Object.assign({ sheet: sheets.length + 1 }, r));
+  }
+
+  // 仍有剩余需求且纸已用完 → 达到上限（循环因无进展退出时已标记 no_progress）
+  if (remaining.size > 0 && sheets.length >= maxSheets) {
+    stopReason = 'max_sheets';
+  }
+
+  const remainingList = [...remaining.values()].map((e) => ({
+    id: e.id,
+    name: e.name,
+    width: round3(e.w),
+    height: round3(e.h),
+    total: e.total,
+    placed: e.total - e.q,
+    quantity: e.q,
+  }));
+
+  const completionRate = totalDemand > 0 ? totalPlaced / totalDemand : 1;
+
+  return {
+    mode: 'batch',
+    paper: { width: round3(paperW), height: round3(paperH), kerf: round3(kerf) },
+    maxSheets,
+    sheets,
+    remaining: remainingList,
+    stats: {
+      totalDemand,
+      totalPlaced,
+      sheetsUsed: sheets.length,
+      maxSheets,
+      completionRate: round3(completionRate * 1000) / 1000, // 0..1
+      totalCuts,
+      stopReason,
+    },
+    stopReason,
+  };
+}
+
+module.exports = { layout, batchLayout, BATCH_MAX_SHEETS_LIMIT };

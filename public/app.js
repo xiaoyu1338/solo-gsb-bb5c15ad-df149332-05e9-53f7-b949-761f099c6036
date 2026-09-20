@@ -7,6 +7,22 @@ const PALETTE = [
 
 const $ = (id) => document.getElementById(id);
 
+let mode = 'single';          // 'single' | 'batch'
+let batchData = null;         // 最近一次批量排产结果
+let currentSheetIdx = 0;      // 当前查看的纸张（0 起）
+
+const STOP_REASON_TEXT = {
+  completed: '全部需求已完成',
+  max_sheets: '已达到最多用纸张数',
+  no_progress: '该纸排不进任何成品，无进展而停止',
+};
+
+const STOP_REASON_CLASS = {
+  completed: 'stop-ok',
+  max_sheets: 'stop-warn',
+  no_progress: 'stop-bad',
+};
+
 function colorFor(id) {
   let h = 0;
   for (const ch of String(id)) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
@@ -56,18 +72,28 @@ function readForm() {
     }
   });
 
-  return { paperW, paperH, kerf, products };
+  const result = { paperW, paperH, kerf, products };
+  if (mode === 'batch') {
+    const maxSheets = Number($('maxSheets').value);
+    if (!(Number.isInteger(maxSheets) && maxSheets >= 1)) {
+      throw new Error('最多用纸张数必须是不小于 1 的整数。');
+    }
+    result.maxSheets = maxSheets;
+  }
+  return result;
 }
 
 function fmt(n) {
   return (Math.round(n * 100) / 100).toLocaleString('zh-CN');
 }
 
-function renderStats(r) {
+function renderStats(r, sheetLabel) {
   const s = r.stats;
   const pct = (s.areaRatio * 100).toFixed(1);
   const low = s.areaRatio < 0.5 ? ' low' : '';
+  const label = sheetLabel ? `<div class="stat" style="flex-basis:100%"><b>${sheetLabel}</b></div>` : '';
   $('stats').innerHTML = `
+    ${label}
     <div class="stat">已排/总数：<b>${s.piecesPlaced}/${s.piecesTotal}</b> 件</div>
     <div class="stat">成品面积：<b>${fmt(s.placedArea)}</b> mm²</div>
     <div class="stat">刀缝面积：<b>${fmt(s.kerfArea)}</b> mm²</div>
@@ -263,6 +289,122 @@ function renderUnplaced(r) {
   `;
 }
 
+function resetResult() {
+  $('batchBar').hidden = true;
+  $('batchBar').innerHTML = '';
+  $('batchRemaining').hidden = true;
+  $('batchRemaining').innerHTML = '';
+  $('stats').innerHTML = '';
+  $('cutList').innerHTML = '';
+  $('unplaced').innerHTML = '';
+  $('svgWrap').innerHTML = '<div class="placeholder">填写左侧参数后点击「生成裁切方案」</div>';
+}
+
+function renderSingle(r) {
+  $('resultTitle').textContent = '排料结果（单张排样）';
+  renderStats(r);
+  renderSvg(r);
+  renderCutList(r);
+  renderUnplaced(r);
+}
+
+function stopBadge(reason) {
+  const cls = STOP_REASON_CLASS[reason] || 'stop-warn';
+  const text = STOP_REASON_TEXT[reason] || reason;
+  return `<span class="stop-badge ${cls}">终止原因：${text}</span>`;
+}
+
+function renderBatchBar(d) {
+  const s = d.stats;
+  const pct = (s.completionRate * 100).toFixed(1);
+  const low = s.completionRate < 1 ? ' low' : '';
+  const opts = d.sheets.map((sheet, i) =>
+    `<option value="${i}"${i === currentSheetIdx ? ' selected' : ''}>第 ${i + 1} 张（${sheet.stats.piecesPlaced} 件 / ${sheet.stats.cutsTotal} 刀）</option>`
+  ).join('');
+  $('batchBar').innerHTML = `
+    <div class="batch-summary">
+      <div class="stat">用纸数：<b>${s.sheetsUsed}</b> / ${s.maxSheets} 张</div>
+      <div class="stat">累计完成：<b>${s.totalPlaced}/${s.totalDemand}</b> 件</div>
+      <div class="stat">总刀数：<b>${s.totalCuts}</b></div>
+      <div class="stat">完成率：<b>${pct}%</b>
+        <div class="ratio-bar${low}"><span style="width:${(s.completionRate * 100).toFixed(2)}%"></span></div>
+      </div>
+    </div>
+    <div class="sheet-nav">
+      <button type="button" id="prevSheet" class="btn btn-ghost"${currentSheetIdx === 0 ? ' disabled' : ''}>← 上一张</button>
+      <select id="sheetSelect" aria-label="选择纸张">${opts}</select>
+      <button type="button" id="nextSheet" class="btn btn-ghost"${currentSheetIdx >= d.sheets.length - 1 ? ' disabled' : ''}>下一张 →</button>
+      ${stopBadge(d.stopReason)}
+    </div>
+  `;
+
+  $('prevSheet').addEventListener('click', () => {
+    if (currentSheetIdx > 0) { currentSheetIdx -= 1; renderCurrentSheet(); }
+  });
+  $('nextSheet').addEventListener('click', () => {
+    if (currentSheetIdx < batchData.sheets.length - 1) { currentSheetIdx += 1; renderCurrentSheet(); }
+  });
+  $('sheetSelect').addEventListener('change', (e) => {
+    currentSheetIdx = Number(e.target.value);
+    renderCurrentSheet();
+  });
+}
+
+function renderBatchRemaining(d) {
+  if (!d.remaining.length) {
+    $('batchRemaining').hidden = true;
+    $('batchRemaining').innerHTML = '';
+    return;
+  }
+  const rows = d.remaining.map((u) => `
+    <tr>
+      <td>${u.name ? `${u.name}（${u.id}）` : u.id}</td>
+      <td>${fmt(u.width)}×${fmt(u.height)}</td>
+      <td>${u.placed} / ${u.total}</td>
+      <td class="badge-bad">${u.quantity} 件剩余</td>
+    </tr>
+  `).join('');
+  $('batchRemaining').innerHTML = `
+    <h3>批量排产后的剩余需求</h3>
+    <table>
+      <thead><tr><th>名称</th><th>规格 宽×高 (mm)</th><th>已排/需求</th><th>剩余</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `;
+  $('batchRemaining').hidden = false;
+}
+
+function renderEmptyBatch(d) {
+  $('stats').innerHTML = '';
+  $('cutList').innerHTML = '';
+  $('unplaced').innerHTML = '';
+  $('svgWrap').innerHTML = '<div class="placeholder">首张纸即排不进任何成品，未用纸。请调整纸张或成品规格。</div>';
+  renderBatchBar(d);
+  renderBatchRemaining(d);
+}
+
+function renderCurrentSheet() {
+  if (!batchData) return;
+  if (!batchData.sheets.length) {
+    renderEmptyBatch(batchData);
+    return;
+  }
+  const r = batchData.sheets[currentSheetIdx];
+  renderStats(r, `第 ${currentSheetIdx + 1} / ${batchData.sheets.length} 张纸`);
+  renderSvg(r);
+  renderCutList(r);
+  renderUnplaced(r);
+  renderBatchBar(batchData);
+}
+
+function renderBatch(d) {
+  batchData = d;
+  currentSheetIdx = 0;
+  $('resultTitle').textContent = '批量排产结果（逐张布局）';
+  renderBatchRemaining(d);
+  renderCurrentSheet();
+}
+
 async function generate() {
   const errBox = $('formError');
   errBox.hidden = true;
@@ -277,17 +419,19 @@ async function generate() {
 
   $('generate').disabled = true;
   try {
-    const resp = await fetch('/api/layout', {
+    const endpoint = mode === 'batch' ? '/api/batch-layout' : '/api/layout';
+    const resp = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || '排样失败');
-    renderStats(data);
-    renderSvg(data);
-    renderCutList(data);
-    renderUnplaced(data);
+    if (mode === 'batch') {
+      renderBatch(data);
+    } else {
+      renderSingle(data);
+    }
   } catch (e) {
     errBox.textContent = e.message;
     errBox.hidden = false;
@@ -311,6 +455,26 @@ $('clearBtn').addEventListener('click', () => {
   addProductRow();
 });
 $('generate').addEventListener('click', generate);
+
+function switchMode(next) {
+  if (mode === next) return;
+  mode = next;
+  batchData = null;
+  currentSheetIdx = 0;
+  document.querySelectorAll('.mode-btn').forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.mode === next);
+  });
+  document.querySelectorAll('.batch-only').forEach((el) => {
+    el.hidden = next !== 'batch';
+  });
+  $('generate').textContent = next === 'batch' ? '开始批量排产' : '生成裁切方案';
+  resetResult();
+  $('resultTitle').textContent = next === 'batch' ? '批量排产结果（逐张布局）' : '排料结果';
+}
+
+document.querySelectorAll('.mode-btn').forEach((btn) => {
+  btn.addEventListener('click', () => switchMode(btn.dataset.mode));
+});
 
 // 初始示例：大度全张 889×1194，刀缝 3mm
 addProductRow('封面', 210, 285, 12);
